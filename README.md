@@ -25,6 +25,8 @@ The predictor now defaults to CPU execution with full `fp32` precision for maxim
 
 This model supports seamless transitions between different generations. Set `prompt_end` and `seed_end` to the same value of video number _n_ as `prompt_start` and `seed_start` of video number _n + 1_.
 
+When you want to anchor either side of the animation to an existing asset, provide the optional `start_image` and/or `end_image` inputs. TileMorph will encode those images into the latent space so the first and/or last animation frames match your references before transitioning through the rest of the prompts.
+
 ## macOS setup and usage
 
 Apple Silicon and Intel Macs can run TileMorph entirely on the CPU. The following steps assume a clean macOS 13+ installation:

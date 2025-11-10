@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 import os
 import torch
+from PIL import Image
 from diffusers import (
     EulerDiscreteScheduler,
     FlowMatchEulerDiscreteScheduler,
@@ -234,6 +235,14 @@ class Predictor(BasePredictor):
             description="Optional specific weight filename within the LoRA repo",
             default=None,
         ),
+        start_image: Optional[Path] = Input(
+            description="Optional initial image to seed the first animation frame",
+            default=None,
+        ),
+        end_image: Optional[Path] = Input(
+            description="Optional final image to use for the last animation frame",
+            default=None,
+        ),
     ) -> Iterator[Path]:
         if seed_start is None:
             seed_start = int.from_bytes(os.urandom(2), "big")
@@ -281,6 +290,8 @@ class Predictor(BasePredictor):
                     intermediate_output,
                     seed_start,
                     seed_end,
+                    start_image,
+                    end_image,
                 )
             else:
                 yield from self._run_stable(
@@ -297,6 +308,8 @@ class Predictor(BasePredictor):
                     seed_start,
                     seed_end,
                     scheduler,
+                    start_image,
+                    end_image,
                 )
 
     def _run_stable(
@@ -314,6 +327,8 @@ class Predictor(BasePredictor):
         seed_start: int,
         seed_end: int,
         scheduler_name: str,
+        start_image: Optional[Path],
+        end_image: Optional[Path],
     ) -> Iterator[Path]:
         generator_device = "cuda" if self.device.startswith("cuda") else "cpu"
         generator_start = torch.Generator(device=generator_device).manual_seed(
@@ -345,28 +360,38 @@ class Predictor(BasePredictor):
                 pipe._encode_prompt(prompt, self.device, 1, do_cfg, "")
             )
 
-        pipe.scheduler = make_scheduler(pipe, scheduler_name)
-        latents_start_gpu = self.denoise(
-            pipe,
-            noise_latents_start,
-            keyframe_embeddings[0],
-            num_inference_steps,
-            guidance_scale,
-            generator_start,
-        )
+        if start_image:
+            latents_start_gpu = self._encode_stable_image(
+                pipe, start_image, width, height
+            )
+        else:
+            pipe.scheduler = make_scheduler(pipe, scheduler_name)
+            latents_start_gpu = self.denoise(
+                pipe,
+                noise_latents_start,
+                keyframe_embeddings[0],
+                num_inference_steps,
+                guidance_scale,
+                generator_start,
+            )
         image_start = pipe.decode_latents(latents_start_gpu)
         pipe.run_safety_checker(image_start, self.device, keyframe_embeddings[0].dtype)
         latents_start = latents_start_gpu.detach().to("cpu", torch.float32)
 
-        pipe.scheduler = make_scheduler(pipe, scheduler_name)
-        latents_end_gpu = self.denoise(
-            pipe,
-            noise_latents_end,
-            keyframe_embeddings[-1],
-            num_inference_steps,
-            guidance_scale,
-            generator_end,
-        )
+        if end_image:
+            latents_end_gpu = self._encode_stable_image(
+                pipe, end_image, width, height
+            )
+        else:
+            pipe.scheduler = make_scheduler(pipe, scheduler_name)
+            latents_end_gpu = self.denoise(
+                pipe,
+                noise_latents_end,
+                keyframe_embeddings[-1],
+                num_inference_steps,
+                guidance_scale,
+                generator_end,
+            )
         image_end = pipe.decode_latents(latents_end_gpu)
         pipe.run_safety_checker(image_end, self.device, keyframe_embeddings[-1].dtype)
         latents_end = latents_end_gpu.detach().to("cpu", torch.float32)
@@ -440,6 +465,8 @@ class Predictor(BasePredictor):
         intermediate_output: bool,
         seed_start: int,
         seed_end: int,
+        start_image: Optional[Path],
+        end_image: Optional[Path],
     ) -> Iterator[Path]:
         generator_device = "cuda" if self.device.startswith("cuda") else "cpu"
         generator_start = torch.Generator(device=generator_device).manual_seed(
@@ -466,31 +493,41 @@ class Predictor(BasePredictor):
                 FluxEmbeddings(prompt_embeds, pooled_prompt_embeds)
             )
 
-        latents_start_gpu = self._flux_denoise(
-            pipe,
-            noise_latents_start,
-            keyframe_embeddings[0],
-            num_inference_steps,
-            guidance_scale,
-            generator_start,
-            height,
-            width,
-        )
+        if start_image:
+            latents_start_gpu = self._encode_flux_image(
+                pipe, start_image, width, height
+            )
+        else:
+            latents_start_gpu = self._flux_denoise(
+                pipe,
+                noise_latents_start,
+                keyframe_embeddings[0],
+                num_inference_steps,
+                guidance_scale,
+                generator_start,
+                height,
+                width,
+            )
         image_start = self._decode_flux_latents(
             pipe, latents_start_gpu, height, width
         )
         latents_start = latents_start_gpu.detach().to("cpu", torch.float32)
 
-        latents_end_gpu = self._flux_denoise(
-            pipe,
-            noise_latents_end,
-            keyframe_embeddings[-1],
-            num_inference_steps,
-            guidance_scale,
-            generator_end,
-            height,
-            width,
-        )
+        if end_image:
+            latents_end_gpu = self._encode_flux_image(
+                pipe, end_image, width, height
+            )
+        else:
+            latents_end_gpu = self._flux_denoise(
+                pipe,
+                noise_latents_end,
+                keyframe_embeddings[-1],
+                num_inference_steps,
+                guidance_scale,
+                generator_end,
+                height,
+                width,
+            )
         image_end = self._decode_flux_latents(pipe, latents_end_gpu, height, width)
         latents_end = latents_end_gpu.detach().to("cpu", torch.float32)
 
@@ -561,6 +598,63 @@ class Predictor(BasePredictor):
             frames_latents, num_interpolation_steps, decode_latents_fn
         )
         yield self.save_mp4(images, frames_per_second, width, height)
+
+    def _encode_stable_image(
+        self,
+        pipe: StableDiffusionPipeline,
+        image_path: Path,
+        width: int,
+        height: int,
+    ) -> torch.Tensor:
+        image = self._load_image(image_path, width, height)
+        pixel_values = pipe.image_processor.preprocess(image)
+        pixel_values = pixel_values.to(self.device, dtype=pipe.vae.dtype)
+        with torch.inference_mode():
+            latents = pipe.vae.encode(pixel_values).latent_dist.mode()
+        latents = latents * pipe.vae.config.scaling_factor
+        return latents.to(self.device, dtype=pipe.unet.dtype)
+
+    def _encode_flux_image(
+        self,
+        pipe: FluxPipeline,
+        image_path: Path,
+        width: int,
+        height: int,
+    ) -> torch.Tensor:
+        image = self._load_image(image_path, width, height)
+        pixel_values = pipe.image_processor.preprocess(image)
+        pixel_values = pixel_values.to(self.device, dtype=pipe.vae.dtype)
+        shift = getattr(pipe.vae.config, "shift_factor", 0.0)
+        scale = getattr(pipe.vae.config, "scaling_factor", 1.0)
+        if torch.is_tensor(shift):
+            shift_tensor = shift.to(self.device, dtype=pixel_values.dtype)
+        elif isinstance(shift, (tuple, list)):
+            shift_tensor = torch.tensor(shift, device=self.device, dtype=pixel_values.dtype).view(1, -1, 1, 1)
+        else:
+            shift_tensor = torch.tensor(float(shift), device=self.device, dtype=pixel_values.dtype)
+        pixel_values = pixel_values - shift_tensor
+        with torch.inference_mode():
+            latents = pipe.vae.encode(pixel_values).latent_dist.mode()
+        if torch.is_tensor(scale):
+            scale_tensor = scale.to(self.device, dtype=latents.dtype)
+        elif isinstance(scale, (tuple, list)):
+            scale_tensor = torch.tensor(scale, device=self.device, dtype=latents.dtype).view(1, -1, 1, 1)
+        else:
+            scale_tensor = torch.tensor(float(scale), device=self.device, dtype=latents.dtype)
+        latents = latents * scale_tensor
+        num_channels = pipe.transformer.config.in_channels // 4
+        latent_height = 2 * (int(height) // pipe.vae_scale_factor)
+        latent_width = 2 * (int(width) // pipe.vae_scale_factor)
+        latents = pipe._pack_latents(latents, 1, num_channels, latent_height, latent_width)
+        return latents.to(self.device, dtype=pipe.transformer.dtype)
+
+    def _load_image(self, image_path: Path, width: int, height: int) -> Image.Image:
+        with Image.open(image_path) as image:
+            image = image.convert("RGB")
+            if image.size != (width, height):
+                image = image.resize((width, height), Image.LANCZOS)
+            image = image.copy()
+        return image
 
     def _flux_noise_latents(
         self,
