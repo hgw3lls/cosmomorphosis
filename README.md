@@ -4,6 +4,15 @@
 
 TileMorph creates a tileable animation between two diffusion prompts. It uses [the circular padding trick](https://gitlab.com/-/snippets/2395088) to generate images that wrap around the edges and now supports the latest [FLUX](https://huggingface.co/black-forest-labs) text-to-image models in addition to traditional Stable Diffusion pipelines.
 
+## How the animation pipeline works
+
+1. **Prompt encoding** – Both `prompt_start` and `prompt_end` are converted into text embeddings (and, if requested, LoRA weights are merged into the text encoder). These embeddings are cached so the same conditioning can be reused across animation frames.
+2. **Anchor denoising** – We run the chosen diffusion pipeline (Stable Diffusion or FLUX) once per key prompt to generate "anchor" latents that define the endpoints of the animation. Seeds keep these anchors repeatable.
+3. **Prompt & noise blending** – For each intermediate animation frame we slerp both the text embeddings and the random noise, then run another denoising pass. `num_animation_frames` controls how many of these heavy diffusion steps happen between each pair of prompts.
+4. **Latent interpolation & video assembly** – Between consecutive denoised latents we optionally linearly blend `num_interpolation_steps` intermediate tensors, decode them with the VAE, and stitch the resulting images into an MP4 at `frames_per_second`.
+
+The predictor automatically switches between CPU and GPU math depending on the `device` input, defaulting to `cpu` for the broadest compatibility.
+
 The animation effect is achieved by interpolating both in CLIP embedding space and latent space.
 * The number of CLIP interpolation steps is controlled by the `num_animation_frames` input. Each "animation frame" runs a full Stable Diffusion inference, which makes it slow but interesting.
 * The number of latent space interpolation steps between animation frames is controlled by the `num_interpolation_steps` input. Each interpolation step only runs a VAE inference, and is fast but less interesting. You can trade off interestingness versus prediction time by tweaking `num_animation_frames` and `num_interpolation_steps`
@@ -15,6 +24,42 @@ You can optionally load LoRA adapters (including FLUX LoRAs) by providing a Hugg
 The predictor now defaults to CPU execution with full `fp32` precision for maximum compatibility. Specify `device=cuda` (and, if desired, a lower precision such as `bf16`) when you want to take advantage of GPU acceleration.
 
 This model supports seamless transitions between different generations. Set `prompt_end` and `seed_end` to the same value of video number _n_ as `prompt_start` and `seed_start` of video number _n + 1_.
+
+## macOS setup and usage
+
+Apple Silicon and Intel Macs can run TileMorph entirely on the CPU. The following steps assume a clean macOS 13+ installation:
+
+1. **Install system tooling**
+   ```bash
+   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+   brew install python@3.10 ffmpeg git
+   pip3 install --user cog
+   ```
+   Restart your shell (or follow the Homebrew post-install instructions) so that `brew`, `python3`, and `cog` are on your `$PATH`.
+2. **Create an isolated environment**
+   ```bash
+   python3 -m venv ~/.venvs/tilemorph
+   source ~/.venvs/tilemorph/bin/activate
+   pip install --upgrade pip
+   pip install cog diffusers transformers accelerate safetensors opencv-python torch torchvision torchaudio
+   ```
+   The universal PyTorch wheels run natively on Apple Silicon; if you prefer Intel-only binaries you can append `--index-url https://download.pytorch.org/whl/cpu` to the final command.
+3. **Download model weights**
+   ```bash
+   cog run script/download-weights <your-hugging-face-auth-token>
+   ```
+   You can omit the token if you have already accepted the relevant model licenses on Hugging Face.
+4. **Run a local prediction**
+   ```bash
+   cog predict \
+       -i prompt_start="sunlit coral reef" \
+       -i prompt_end="aurora over snowy mountains" \
+       -i seed_start=123 \
+       -i seed_end=456 \
+       -i base_model="black-forest-labs/FLUX.1-dev" \
+       -i device=cpu
+   ```
+   The default `device=cpu` works well on macOS. If you have an external GPU enclosure that exposes CUDA, you can override the device with `-i device=cuda` to enable mixed precision.
 
 ## Development
 
