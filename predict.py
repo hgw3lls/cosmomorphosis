@@ -360,41 +360,39 @@ class Predictor(BasePredictor):
                 pipe._encode_prompt(prompt, self.device, 1, do_cfg, "")
             )
 
-        if start_image:
-            latents_start_gpu = self._encode_stable_image(
-                pipe, start_image, width, height
-            )
-        else:
-            pipe.scheduler = make_scheduler(pipe, scheduler_name)
-            latents_start_gpu = self.denoise(
-                pipe,
-                noise_latents_start,
-                keyframe_embeddings[0],
-                num_inference_steps,
-                guidance_scale,
-                generator_start,
-            )
-        image_start = pipe.decode_latents(latents_start_gpu)
-        pipe.run_safety_checker(image_start, self.device, keyframe_embeddings[0].dtype)
-        latents_start = latents_start_gpu.detach().to("cpu", torch.float32)
+        (
+            latents_start_gpu,
+            latents_start,
+            image_start,
+        ) = self._prepare_stable_anchor(
+            pipe,
+            start_image,
+            width,
+            height,
+            noise_latents_start,
+            keyframe_embeddings[0],
+            num_inference_steps,
+            guidance_scale,
+            generator_start,
+            scheduler_name,
+        )
 
-        if end_image:
-            latents_end_gpu = self._encode_stable_image(
-                pipe, end_image, width, height
-            )
-        else:
-            pipe.scheduler = make_scheduler(pipe, scheduler_name)
-            latents_end_gpu = self.denoise(
-                pipe,
-                noise_latents_end,
-                keyframe_embeddings[-1],
-                num_inference_steps,
-                guidance_scale,
-                generator_end,
-            )
-        image_end = pipe.decode_latents(latents_end_gpu)
-        pipe.run_safety_checker(image_end, self.device, keyframe_embeddings[-1].dtype)
-        latents_end = latents_end_gpu.detach().to("cpu", torch.float32)
+        (
+            latents_end_gpu,
+            latents_end,
+            image_end,
+        ) = self._prepare_stable_anchor(
+            pipe,
+            end_image,
+            width,
+            height,
+            noise_latents_end,
+            keyframe_embeddings[-1],
+            num_inference_steps,
+            guidance_scale,
+            generator_end,
+            scheduler_name,
+        )
 
         frames_latents: List[torch.Tensor] = []
 
@@ -493,43 +491,37 @@ class Predictor(BasePredictor):
                 FluxEmbeddings(prompt_embeds, pooled_prompt_embeds)
             )
 
-        if start_image:
-            latents_start_gpu = self._encode_flux_image(
-                pipe, start_image, width, height
-            )
-        else:
-            latents_start_gpu = self._flux_denoise(
-                pipe,
-                noise_latents_start,
-                keyframe_embeddings[0],
-                num_inference_steps,
-                guidance_scale,
-                generator_start,
-                height,
-                width,
-            )
-        image_start = self._decode_flux_latents(
-            pipe, latents_start_gpu, height, width
+        (
+            latents_start_gpu,
+            latents_start,
+            image_start,
+        ) = self._prepare_flux_anchor(
+            pipe,
+            start_image,
+            width,
+            height,
+            noise_latents_start,
+            keyframe_embeddings[0],
+            num_inference_steps,
+            guidance_scale,
+            generator_start,
         )
-        latents_start = latents_start_gpu.detach().to("cpu", torch.float32)
 
-        if end_image:
-            latents_end_gpu = self._encode_flux_image(
-                pipe, end_image, width, height
-            )
-        else:
-            latents_end_gpu = self._flux_denoise(
-                pipe,
-                noise_latents_end,
-                keyframe_embeddings[-1],
-                num_inference_steps,
-                guidance_scale,
-                generator_end,
-                height,
-                width,
-            )
-        image_end = self._decode_flux_latents(pipe, latents_end_gpu, height, width)
-        latents_end = latents_end_gpu.detach().to("cpu", torch.float32)
+        (
+            latents_end_gpu,
+            latents_end,
+            image_end,
+        ) = self._prepare_flux_anchor(
+            pipe,
+            end_image,
+            width,
+            height,
+            noise_latents_end,
+            keyframe_embeddings[-1],
+            num_inference_steps,
+            guidance_scale,
+            generator_end,
+        )
 
         frames_latents: List[torch.Tensor] = []
 
@@ -675,6 +667,71 @@ class Predictor(BasePredictor):
         return pipe._pack_latents(
             latents, 1, num_channels, latent_height, latent_width
         )
+
+    def _prepare_stable_anchor(
+        self,
+        pipe: StableDiffusionPipeline,
+        image_path: Optional[Path],
+        width: int,
+        height: int,
+        noise_latents: torch.Tensor,
+        text_embeddings: torch.Tensor,
+        num_inference_steps: int,
+        guidance_scale: float,
+        generator: torch.Generator,
+        scheduler_name: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor, np.ndarray]:
+        if image_path is not None:
+            latents_gpu = self._encode_stable_image(
+                pipe, image_path, width, height
+            )
+        else:
+            pipe.scheduler = make_scheduler(pipe, scheduler_name)
+            latents_gpu = self.denoise(
+                pipe,
+                noise_latents,
+                text_embeddings,
+                num_inference_steps,
+                guidance_scale,
+                generator,
+            )
+
+        image = pipe.decode_latents(latents_gpu)
+        pipe.run_safety_checker(image, self.device, text_embeddings.dtype)
+        latents_cpu = latents_gpu.detach().to("cpu", torch.float32)
+        return latents_gpu, latents_cpu, image
+
+    def _prepare_flux_anchor(
+        self,
+        pipe: FluxPipeline,
+        image_path: Optional[Path],
+        width: int,
+        height: int,
+        noise_latents: torch.Tensor,
+        embeddings: FluxEmbeddings,
+        num_inference_steps: int,
+        guidance_scale: float,
+        generator: torch.Generator,
+    ) -> Tuple[torch.Tensor, torch.Tensor, np.ndarray]:
+        if image_path is not None:
+            latents_gpu = self._encode_flux_image(
+                pipe, image_path, width, height
+            )
+        else:
+            latents_gpu = self._flux_denoise(
+                pipe,
+                noise_latents,
+                embeddings,
+                num_inference_steps,
+                guidance_scale,
+                generator,
+                height,
+                width,
+            )
+
+        image = self._decode_flux_latents(pipe, latents_gpu, height, width)
+        latents_cpu = latents_gpu.detach().to("cpu", torch.float32)
+        return latents_gpu, latents_cpu, image
 
     def _flux_denoise(
         self,
