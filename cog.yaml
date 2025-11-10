@@ -1,26 +1,22 @@
 build:
   gpu: true
-  cuda: "11.3"
+  cuda: "12.1"
   python_version: "3.10"
   system_packages:
     - "ffmpeg"
   python_packages:
-    - "diffusers==0.12.1"
-    - "torch==1.13.1"
-    - "ftfy==6.1.1"
-    - "scipy==1.9.3"
-    - "transformers==4.25.1"
-    - "accelerate==0.15.0"
-    - "opencv-python==4.6.0.66"
-    - "av==9.2.0"
-    - "jupyterlab==3.5.3"
-    - "gdown==4.6.0"
-    - "xformers==0.0.16"
-    - "triton==2.0.0.dev20230208"
+    - "diffusers==0.31.0"
+    - "transformers==4.44.2"
+    - "accelerate==0.34.2"
+    - "safetensors==0.4.5"
+    - "sentencepiece==0.1.99"
+    - "huggingface-hub==0.26.2"
+    - "opencv-python==4.10.0.84"
+    - "av==12.1.0"
+    - "xformers==0.0.26.post1"
 
   run:
-    - "gdown https://storage.googleapis.com/dan-scratch-public/aitemplate-0.1.dev1-py3-none-any.whl -O aitemplate-0.1.dev1-py3-none-any.whl"
-    - "pip install aitemplate-0.1.dev1-py3-none-any.whl --force-reinstall"
+    - "pip install --upgrade --no-cache-dir torch==2.1.2+cu121 torchvision==0.16.2+cu121 torchaudio==2.1.2+cu121 --index-url https://download.pytorch.org/whl/cu121"
 
 predict: "predict.py:Predictor"
 image: "r8.im/andreasjansson/tile-morph"

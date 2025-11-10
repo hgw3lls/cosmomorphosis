@@ -1,22 +1,67 @@
-import sys
-import os
-from typing import Optional, List, Iterator
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
+from typing import Any, Iterator, List, Optional, Tuple
 
-import cv2
 import av
+import cv2
 import numpy as np
+import os
 import torch
-from torch import autocast
-from diffusers import (
-    StableDiffusionPipeline,
-    PNDMScheduler,
-    LMSDiscreteScheduler,
-    EulerDiscreteScheduler,
-)
 from PIL import Image
+from diffusers import (
+    EulerDiscreteScheduler,
+    FlowMatchEulerDiscreteScheduler,
+    FluxPipeline,
+    LMSDiscreteScheduler,
+    PNDMScheduler,
+    StableDiffusionPipeline,
+)
+from diffusers.utils.torch_utils import randn_tensor
 from cog import BasePredictor, Input, Path
 
 MODEL_CACHE = "diffusers-cache"
+
+
+@dataclass
+class FluxEmbeddings:
+    prompt_embeds: torch.Tensor
+    pooled_prompt_embeds: torch.Tensor
+
+
+@contextmanager
+def lora_adapter(
+    pipe,
+    lora_weights: Optional[str],
+    lora_scale: Optional[float] = None,
+    weight_name: Optional[str] = None,
+    adapter_name: str = "_tmp_lora",
+):
+    if not lora_weights:
+        yield
+        return
+
+    if not hasattr(pipe, "load_lora_weights"):
+        raise ValueError("This pipeline does not support loading LoRA adapters.")
+
+    load_kwargs = {"adapter_name": adapter_name}
+    if weight_name:
+        load_kwargs["weight_name"] = weight_name
+    pipe.load_lora_weights(lora_weights, **load_kwargs)
+
+    fuse_kwargs = {}
+    if lora_scale is not None:
+        fuse_kwargs["lora_scale"] = lora_scale
+    pipe.fuse_lora(**fuse_kwargs)
+
+    try:
+        yield
+    finally:
+        if hasattr(pipe, "unfuse_lora"):
+            pipe.unfuse_lora()
+        if hasattr(pipe, "delete_adapters"):
+            pipe.delete_adapters([adapter_name])
+        elif hasattr(pipe, "unload_lora_weights"):
+            pipe.unload_lora_weights()
 
 
 def patch_conv(**patch):
@@ -36,20 +81,80 @@ patch_conv(padding_mode="circular")
 
 class Predictor(BasePredictor):
     def setup(self):
-        """Load the model into memory to make running multiple predictions efficient"""
-        print("Loading pipeline...")
-        self.pipe = StableDiffusionPipeline.from_pretrained(
-            "runwayml/stable-diffusion-v1-5",
-            revision="fp16",
-            torch_dtype=torch.float16,
-            cache_dir=MODEL_CACHE,
-            local_files_only=True,
-        ).to("cuda")
-        self.pipe.enable_xformers_memory_efficient_attention()
+        print("Initializing predictor caches...")
+        self.device = "cpu"
+        self._pipelines: dict[Tuple[str, str, str, str], Tuple[Any, str]] = {}
 
-    @torch.inference_mode()
-    @torch.no_grad()
-    @torch.cuda.amp.autocast()
+    def get_pipeline(
+        self,
+        base_model: str,
+        precision: str,
+        scheduler_name: str,
+        device: str,
+    ) -> Tuple[Any, str]:
+        precision = precision.lower()
+        key = (base_model, precision, scheduler_name, device)
+        if key in self._pipelines:
+            return self._pipelines[key]
+        dtype_map = {
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+            "fp32": torch.float32,
+        }
+        if precision not in dtype_map:
+            raise ValueError(f"Unsupported precision '{precision}'.")
+        dtype = dtype_map[precision]
+
+        if device.startswith("cpu") and precision != "fp32":
+            raise ValueError("CPU execution only supports fp32 precision.")
+
+        is_flux = "flux" in base_model.lower()
+
+        if is_flux:
+            pipe: FluxPipeline = FluxPipeline.from_pretrained(
+                base_model,
+                torch_dtype=dtype,
+                cache_dir=MODEL_CACHE,
+                local_files_only=False,
+            )
+            pipe.to(device, dtype=dtype)
+            pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+                pipe.scheduler.config
+            )
+            backend = "flux"
+        else:
+            pipe = StableDiffusionPipeline.from_pretrained(
+                base_model,
+                torch_dtype=dtype,
+                cache_dir=MODEL_CACHE,
+                local_files_only=False,
+            )
+            pipe.to(device, dtype=dtype)
+            if hasattr(pipe, "enable_xformers_memory_efficient_attention"):
+                pipe.enable_xformers_memory_efficient_attention()
+            pipe.scheduler = make_scheduler(pipe, scheduler_name)
+            backend = "stable"
+
+        pipe.set_progress_bar_config(disable=True)
+        self._pipelines[key] = (pipe, backend)
+        return pipe, backend
+
+    def _resolve_device(self, device_choice: str) -> str:
+        choice = device_choice.lower()
+        if choice == "auto":
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        if choice == "cuda":
+            if not torch.cuda.is_available():
+                raise ValueError(
+                    "CUDA device was requested but is not available in this environment."
+                )
+            return "cuda"
+        if choice != "cpu":
+            raise ValueError(
+                "Device must be one of 'cpu', 'cuda', or 'auto'."
+            )
+        return "cpu"
+
     def predict(
         self,
         prompt_start: str = Input(description="Prompt to start the animation with"),
@@ -63,7 +168,7 @@ class Predictor(BasePredictor):
         ),
         height: int = Input(
             description="Height of output video",
-            choices=[128, 256, 512, 768],
+            choices=[128, 256, 512, 768, 1024],
             default=512,
         ),
         num_interpolation_steps: int = Input(
@@ -73,13 +178,13 @@ class Predictor(BasePredictor):
             default=20,
         ),
         num_inference_steps: int = Input(
-            description="Number of denoising steps", ge=1, le=5000, default=50
+            description="Number of denoising steps", ge=1, le=5000, default=30
         ),
         num_animation_frames: int = Input(
             description="Number of frames to animate", default=10, ge=2, le=50
         ),
         guidance_scale: float = Input(
-            description="Scale for classifier-free guidance", ge=1, le=20, default=7.5
+            description="Scale for classifier-free guidance", ge=0, le=20, default=3.5
         ),
         frames_per_second: int = Input(
             description="Frames per second in output video",
@@ -99,169 +204,611 @@ class Predictor(BasePredictor):
             description="Random seed for last prompt. Leave blank to randomize the seed",
             default=None,
         ),
+        base_model: str = Input(
+            description="Base diffusion model to load",
+            default="black-forest-labs/FLUX.1-dev",
+        ),
+        precision: str = Input(
+            description="Precision to run the model with",
+            default="fp32",
+            choices=["fp16", "bf16", "fp32"],
+        ),
+        scheduler: str = Input(
+            description="Scheduler to use with Stable Diffusion backends",
+            default="euler",
+            choices=["pndm", "lms", "euler"],
+        ),
+        device: str = Input(
+            description="Device to run inference on (defaults to CPU)",
+            default="cpu",
+            choices=["cpu", "cuda", "auto"],
+        ),
+        lora_weights: Optional[str] = Input(
+            description="Optional path or Hugging Face repo containing a LoRA adapter",
+            default=None,
+        ),
+        lora_scale: float = Input(
+            description="Scale factor to apply to the loaded LoRA",
+            default=0.75,
+        ),
+        lora_weight_name: Optional[str] = Input(
+            description="Optional specific weight filename within the LoRA repo",
+            default=None,
+        ),
+        start_image: Optional[Path] = Input(
+            description="Optional initial image to seed the first animation frame",
+            default=None,
+        ),
+        end_image: Optional[Path] = Input(
+            description="Optional final image to use for the last animation frame",
+            default=None,
+        ),
     ) -> Iterator[Path]:
-        """Run a single prediction on the model"""
-        with torch.autocast("cuda"), torch.inference_mode():
-            if seed_start is None:
-                seed_start = int.from_bytes(os.urandom(2), "big")
-            if seed_end is None:
-                seed_end = int.from_bytes(os.urandom(2), "big")
-            print(f"Using seeds: {seed_start}, {seed_end}")
-            generator_start = torch.Generator("cuda").manual_seed(seed_start)
-            generator_end = torch.Generator("cuda").manual_seed(seed_end)
+        if seed_start is None:
+            seed_start = int.from_bytes(os.urandom(2), "big")
+        if seed_end is None:
+            seed_end = int.from_bytes(os.urandom(2), "big")
+        print(f"Using seeds: {seed_start}, {seed_end}")
 
-            batch_size = 1
+        resolved_device = self._resolve_device(device)
+        self.device = resolved_device
+        pipe, backend = self.get_pipeline(
+            base_model, precision, scheduler, resolved_device
+        )
 
-            # Generate initial latents to start to generate animation frames from
-            initial_scheduler = self.pipe.scheduler = make_scheduler(
-                num_inference_steps
+        autocast_dtype = {
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+            "fp32": torch.float32,
+        }[precision.lower()]
+        autocast_device = (
+            "cuda" if self.device.startswith("cuda") else self.device
+        )
+
+        prompts = [prompt_start] + [
+            p.strip() for p in prompt_end.split("|") if p.strip()
+        ]
+
+        with (
+            torch.autocast(autocast_device, dtype=autocast_dtype)
+            if self.device != "cpu"
+            else nullcontext()
+        ), torch.inference_mode(), lora_adapter(
+            pipe, lora_weights, lora_scale, lora_weight_name
+        ):
+            if backend == "flux":
+                yield from self._run_flux(
+                    pipe,
+                    prompts,
+                    width,
+                    height,
+                    num_interpolation_steps,
+                    num_inference_steps,
+                    num_animation_frames,
+                    guidance_scale,
+                    frames_per_second,
+                    intermediate_output,
+                    seed_start,
+                    seed_end,
+                    start_image,
+                    end_image,
+                )
+            else:
+                yield from self._run_stable(
+                    pipe,
+                    prompts,
+                    width,
+                    height,
+                    num_interpolation_steps,
+                    num_inference_steps,
+                    num_animation_frames,
+                    guidance_scale,
+                    frames_per_second,
+                    intermediate_output,
+                    seed_start,
+                    seed_end,
+                    scheduler,
+                    start_image,
+                    end_image,
+                )
+
+    def _run_stable(
+        self,
+        pipe: StableDiffusionPipeline,
+        prompts: List[str],
+        width: int,
+        height: int,
+        num_interpolation_steps: int,
+        num_inference_steps: int,
+        num_animation_frames: int,
+        guidance_scale: float,
+        frames_per_second: int,
+        intermediate_output: bool,
+        seed_start: int,
+        seed_end: int,
+        scheduler_name: str,
+        start_image: Optional[Path],
+        end_image: Optional[Path],
+    ) -> Iterator[Path]:
+        generator_device = "cuda" if self.device.startswith("cuda") else "cpu"
+        generator_start = torch.Generator(device=generator_device).manual_seed(
+            seed_start
+        )
+        generator_end = torch.Generator(device=generator_device).manual_seed(seed_end)
+
+        pipe.scheduler = make_scheduler(pipe, scheduler_name)
+        noise_latents_start = torch.randn(
+            (1, pipe.unet.in_channels, height // 8, width // 8),
+            generator=generator_start,
+            device=self.device,
+            dtype=pipe.unet.dtype,
+        )
+        noise_latents_end = torch.randn(
+            (1, pipe.unet.in_channels, height // 8, width // 8),
+            generator=generator_end,
+            device=self.device,
+            dtype=pipe.unet.dtype,
+        )
+
+        noise_latents_start_cpu = noise_latents_start.detach().to("cpu", torch.float32)
+        noise_latents_end_cpu = noise_latents_end.detach().to("cpu", torch.float32)
+
+        do_cfg = guidance_scale > 1.0
+        keyframe_embeddings: List[torch.Tensor] = []
+        for prompt in prompts:
+            keyframe_embeddings.append(
+                pipe._encode_prompt(prompt, self.device, 1, do_cfg, "")
             )
-            noise_latents_start = torch.randn(
-                (batch_size, self.pipe.unet.in_channels, height // 8, width // 8),
-                generator=generator_start,
-                device="cuda",
+
+        (
+            latents_start_gpu,
+            latents_start,
+            image_start,
+        ) = self._prepare_stable_anchor(
+            pipe,
+            start_image,
+            width,
+            height,
+            noise_latents_start,
+            keyframe_embeddings[0],
+            num_inference_steps,
+            guidance_scale,
+            generator_start,
+            scheduler_name,
+        )
+
+        (
+            latents_end_gpu,
+            latents_end,
+            image_end,
+        ) = self._prepare_stable_anchor(
+            pipe,
+            end_image,
+            width,
+            height,
+            noise_latents_end,
+            keyframe_embeddings[-1],
+            num_inference_steps,
+            guidance_scale,
+            generator_end,
+            scheduler_name,
+        )
+
+        frames_latents: List[torch.Tensor] = []
+
+        if intermediate_output:
+            yield save_pil_image(
+                pipe.numpy_to_pil([image_start])[0], path="/tmp/output-0.png"
             )
-            noise_latents_end = torch.randn(
-                (batch_size, self.pipe.unet.in_channels, height // 8, width // 8),
-                generator=generator_end,
-                device="cuda",
-            )
-            do_classifier_free_guidance = guidance_scale > 1.0
 
-            print("Generating first and last keyframes")
-            # re-initialize scheduler
-            self.pipe.scheduler = make_scheduler(num_inference_steps, initial_scheduler)
-
-            prompts = [prompt_start] + [
-                p.strip() for p in prompt_end.strip().split("|")
-            ]
-            keyframe_text_embeddings = []
-
-            for prompt in prompts:
-                keyframe_text_embeddings.append(
-                    self.pipe._encode_prompt(
-                        prompt, "cuda", 1, do_classifier_free_guidance, ""
+        for keyframe in range(len(prompts) - 1):
+            for i in range(num_animation_frames):
+                if keyframe == 0 and i == 0:
+                    latents_gpu = latents_start_gpu
+                    latents_cpu = latents_start
+                else:
+                    ratio = i / num_animation_frames
+                    text_embeddings = slerp(
+                        ratio,
+                        keyframe_embeddings[keyframe],
+                        keyframe_embeddings[keyframe + 1],
                     )
-                )
+                    noise_latents = slerp(
+                        ratio, noise_latents_start_cpu, noise_latents_end_cpu
+                    ).to(self.device, dtype=pipe.unet.dtype)
 
-            # re-initialize scheduler
-            self.pipe.scheduler = make_scheduler(num_inference_steps, initial_scheduler)
-            latents_start = self.denoise(
-                latents=noise_latents_start,
-                text_embeddings=keyframe_text_embeddings[0],
-                t_start=0,
-                t_end=None,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                generator=generator_start,
+                    pipe.scheduler = make_scheduler(pipe, scheduler_name)
+                    latents_gpu = self.denoise(
+                        pipe,
+                        noise_latents,
+                        text_embeddings,
+                        num_inference_steps,
+                        guidance_scale,
+                        generator_start,
+                    )
+                    latents_cpu = latents_gpu.detach().to("cpu", torch.float32)
+
+                frames_latents.append(latents_cpu)
+
+                if intermediate_output and (i > 0 or keyframe > 0):
+                    image = pipe.decode_latents(latents_gpu)
+                    yield save_pil_image(
+                        pipe.numpy_to_pil([image])[0],
+                        path=f"/tmp/output-{keyframe}-{i}.png",
+                    )
+
+        frames_latents.append(latents_end)
+
+        def decode_latents_fn(latents: torch.Tensor) -> np.ndarray:
+            latents = latents.to(self.device, dtype=pipe.unet.dtype)
+            image = pipe.decode_latents(latents)[0].astype("float32")
+            return image
+
+        images = self.interpolate_latents(
+            frames_latents, num_interpolation_steps, decode_latents_fn
+        )
+        yield self.save_mp4(images, frames_per_second, width, height)
+
+    def _run_flux(
+        self,
+        pipe: FluxPipeline,
+        prompts: List[str],
+        width: int,
+        height: int,
+        num_interpolation_steps: int,
+        num_inference_steps: int,
+        num_animation_frames: int,
+        guidance_scale: float,
+        frames_per_second: int,
+        intermediate_output: bool,
+        seed_start: int,
+        seed_end: int,
+        start_image: Optional[Path],
+        end_image: Optional[Path],
+    ) -> Iterator[Path]:
+        generator_device = "cuda" if self.device.startswith("cuda") else "cpu"
+        generator_start = torch.Generator(device=generator_device).manual_seed(
+            seed_start
+        )
+        generator_end = torch.Generator(device=generator_device).manual_seed(seed_end)
+
+        noise_latents_start = self._flux_noise_latents(
+            pipe, height, width, generator_start
+        )
+        noise_latents_end = self._flux_noise_latents(pipe, height, width, generator_end)
+
+        noise_latents_start_cpu = noise_latents_start.detach().to("cpu", torch.float32)
+        noise_latents_end_cpu = noise_latents_end.detach().to("cpu", torch.float32)
+
+        keyframe_embeddings: List[FluxEmbeddings] = []
+        for prompt in prompts:
+            prompt_embeds, pooled_prompt_embeds, _ = pipe.encode_prompt(
+                prompt=prompt,
+                device=self.device,
+                num_images_per_prompt=1,
+            )
+            keyframe_embeddings.append(
+                FluxEmbeddings(prompt_embeds, pooled_prompt_embeds)
             )
 
-            image_start = self.pipe.decode_latents(latents_start)
-            self.pipe.run_safety_checker(
-                image_start, "cuda", keyframe_text_embeddings[0].dtype
+        (
+            latents_start_gpu,
+            latents_start,
+            image_start,
+        ) = self._prepare_flux_anchor(
+            pipe,
+            start_image,
+            width,
+            height,
+            noise_latents_start,
+            keyframe_embeddings[0],
+            num_inference_steps,
+            guidance_scale,
+            generator_start,
+        )
+
+        (
+            latents_end_gpu,
+            latents_end,
+            image_end,
+        ) = self._prepare_flux_anchor(
+            pipe,
+            end_image,
+            width,
+            height,
+            noise_latents_end,
+            keyframe_embeddings[-1],
+            num_inference_steps,
+            guidance_scale,
+            generator_end,
+        )
+
+        frames_latents: List[torch.Tensor] = []
+
+        if intermediate_output:
+            yield save_pil_image(
+                pipe.numpy_to_pil([image_start])[0], path="/tmp/output-0.png"
             )
 
-            # re-initialize scheduler
-            self.pipe.scheduler = make_scheduler(num_inference_steps, initial_scheduler)
-            latents_end = self.denoise(
-                latents=noise_latents_end,
-                text_embeddings=keyframe_text_embeddings[-1],
-                t_start=0,
-                t_end=None,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                generator=generator_end,
-            )
-            image_end = self.pipe.decode_latents(latents_end)
-            self.pipe.run_safety_checker(
-                image_end, "cuda", keyframe_text_embeddings[0].dtype
-            )
+        for keyframe in range(len(prompts) - 1):
+            for i in range(num_animation_frames):
+                if keyframe == 0 and i == 0:
+                    latents_gpu = latents_start_gpu
+                    latents_cpu = latents_start
+                else:
+                    ratio = i / num_animation_frames
+                    prompt_embeds = slerp(
+                        ratio,
+                        keyframe_embeddings[keyframe].prompt_embeds,
+                        keyframe_embeddings[keyframe + 1].prompt_embeds,
+                    )
+                    pooled_prompt_embeds = slerp(
+                        ratio,
+                        keyframe_embeddings[keyframe].pooled_prompt_embeds,
+                        keyframe_embeddings[keyframe + 1].pooled_prompt_embeds,
+                    )
+                    embeddings = FluxEmbeddings(
+                        prompt_embeds.to(self.device, dtype=pipe.transformer.dtype),
+                        pooled_prompt_embeds.to(
+                            self.device, dtype=pipe.transformer.dtype
+                        ),
+                    )
 
-            if intermediate_output:
-                yield save_pil_image(
-                    self.pipe.numpy_to_pil(image_start)[0], path="/tmp/output-0.png"
-                )
+                    noise_latents = slerp(
+                        ratio, noise_latents_start_cpu, noise_latents_end_cpu
+                    ).to(self.device, dtype=pipe.transformer.dtype)
 
-            # Generate animation frames
-            frames_latents = []
-            for keyframe in range(len(prompts) - 1):
-                for i in range(num_animation_frames):
-                    if keyframe == 0 and i == 0:
-                        latents = latents_start
-                    else:
-                        print(f"Generating frame {i} of keyframe {keyframe}")
-                        text_embeddings = slerp(
-                            i / num_animation_frames,
-                            keyframe_text_embeddings[keyframe],
-                            keyframe_text_embeddings[keyframe + 1],
-                        )
+                    latents_gpu = self._flux_denoise(
+                        pipe,
+                        noise_latents,
+                        embeddings,
+                        num_inference_steps,
+                        guidance_scale,
+                        generator_start,
+                        height,
+                        width,
+                    )
+                    latents_cpu = latents_gpu.detach().to("cpu", torch.float32)
 
-                        # re-initialize scheduler
-                        self.pipe.scheduler = make_scheduler(
-                            num_inference_steps, initial_scheduler
-                        )
-                        noise_latents = slerp(
-                            i / num_animation_frames,
-                            noise_latents_start,
-                            noise_latents_end,
-                        )
-                        import time
+                frames_latents.append(latents_cpu)
 
-                        t = time.time()
-                        latents = self.denoise(
-                            latents=noise_latents,
-                            text_embeddings=text_embeddings,
-                            t_start=0,
-                            t_end=None,
-                            num_inference_steps=num_inference_steps,
-                            guidance_scale=guidance_scale,
-                            generator=generator_start,
-                        )
-                        print(
-                            f"denoise {time.time() - t=}"
-                        )  # TODO(andreas): remove debug
+                if intermediate_output and (i > 0 or keyframe > 0):
+                    image = self._decode_flux_latents(
+                        pipe, latents_gpu, height, width
+                    )
+                    yield save_pil_image(
+                        pipe.numpy_to_pil([image])[0],
+                        path=f"/tmp/output-{keyframe}-{i}.png",
+                    )
 
-                    # de-noise this frame
-                    frames_latents.append(latents)
-                    if intermediate_output and i > 0:
-                        image = self.pipe.decode_latents(latents)
-                        yield save_pil_image(
-                            self.pipe.numpy_to_pil(image)[0],
-                            path=f"/tmp/output-{i}.png",
-                        )
-            frames_latents.append(latents_end)
+        frames_latents.append(latents_end)
 
-            # for i in frames_latents: yield i
-            # return
+        def decode_latents_fn(latents: torch.Tensor) -> np.ndarray:
+            return self._decode_flux_latents(pipe, latents, height, width)
 
-            images = self.interpolate_latents(frames_latents, num_interpolation_steps)
-            # for i in images:
-            #    yield i
-            # return
+        images = self.interpolate_latents(
+            frames_latents, num_interpolation_steps, decode_latents_fn
+        )
+        yield self.save_mp4(images, frames_per_second, width, height)
 
-            # images = [
-            #    self.pipe.decode_latents(lat)[0].astype("float32")
-            #    for lat in frames_latents
-            # ]
-            yield self.save_mp4(images, frames_per_second, width, height)
-
-    def interpolate_latents(self, frames_latents, num_interpolation_steps):
-        print("Interpolating images from latents")
-        images = []
+    def _encode_stable_image(
+        self,
+        pipe: StableDiffusionPipeline,
+        image_path: Path,
+        width: int,
+        height: int,
+    ) -> torch.Tensor:
+        image = self._load_image(image_path, width, height)
+        pixel_values = pipe.image_processor.preprocess(image)
+        pixel_values = pixel_values.to(self.device, dtype=pipe.vae.dtype)
         with torch.inference_mode():
+            latents = pipe.vae.encode(pixel_values).latent_dist.mode()
+        latents = latents * pipe.vae.config.scaling_factor
+        return latents.to(self.device, dtype=pipe.unet.dtype)
+
+    def _encode_flux_image(
+        self,
+        pipe: FluxPipeline,
+        image_path: Path,
+        width: int,
+        height: int,
+    ) -> torch.Tensor:
+        image = self._load_image(image_path, width, height)
+        pixel_values = pipe.image_processor.preprocess(image)
+        pixel_values = pixel_values.to(self.device, dtype=pipe.vae.dtype)
+        shift = getattr(pipe.vae.config, "shift_factor", 0.0)
+        scale = getattr(pipe.vae.config, "scaling_factor", 1.0)
+        if torch.is_tensor(shift):
+            shift_tensor = shift.to(self.device, dtype=pixel_values.dtype)
+        elif isinstance(shift, (tuple, list)):
+            shift_tensor = torch.tensor(shift, device=self.device, dtype=pixel_values.dtype).view(1, -1, 1, 1)
+        else:
+            shift_tensor = torch.tensor(float(shift), device=self.device, dtype=pixel_values.dtype)
+        pixel_values = pixel_values - shift_tensor
+        with torch.inference_mode():
+            latents = pipe.vae.encode(pixel_values).latent_dist.mode()
+        if torch.is_tensor(scale):
+            scale_tensor = scale.to(self.device, dtype=latents.dtype)
+        elif isinstance(scale, (tuple, list)):
+            scale_tensor = torch.tensor(scale, device=self.device, dtype=latents.dtype).view(1, -1, 1, 1)
+        else:
+            scale_tensor = torch.tensor(float(scale), device=self.device, dtype=latents.dtype)
+        latents = latents * scale_tensor
+        num_channels = pipe.transformer.config.in_channels // 4
+        latent_height = 2 * (int(height) // pipe.vae_scale_factor)
+        latent_width = 2 * (int(width) // pipe.vae_scale_factor)
+        latents = pipe._pack_latents(latents, 1, num_channels, latent_height, latent_width)
+        return latents.to(self.device, dtype=pipe.transformer.dtype)
+
+    def _load_image(self, image_path: Path, width: int, height: int) -> Image.Image:
+        with Image.open(image_path) as image:
+            image = image.convert("RGB")
+            if image.size != (width, height):
+                image = image.resize((width, height), Image.LANCZOS)
+            image = image.copy()
+        return image
+
+    def _flux_noise_latents(
+        self,
+        pipe: FluxPipeline,
+        height: int,
+        width: int,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        latent_height = 2 * (int(height) // pipe.vae_scale_factor)
+        latent_width = 2 * (int(width) // pipe.vae_scale_factor)
+        num_channels = pipe.transformer.config.in_channels // 4
+        latents = randn_tensor(
+            (1, num_channels, latent_height, latent_width),
+            generator=generator,
+            device=self.device,
+            dtype=pipe.transformer.dtype,
+        )
+        return pipe._pack_latents(
+            latents, 1, num_channels, latent_height, latent_width
+        )
+
+    def _prepare_stable_anchor(
+        self,
+        pipe: StableDiffusionPipeline,
+        image_path: Optional[Path],
+        width: int,
+        height: int,
+        noise_latents: torch.Tensor,
+        text_embeddings: torch.Tensor,
+        num_inference_steps: int,
+        guidance_scale: float,
+        generator: torch.Generator,
+        scheduler_name: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor, np.ndarray]:
+        if image_path is not None:
+            latents_gpu = self._encode_stable_image(
+                pipe, image_path, width, height
+            )
+        else:
+            pipe.scheduler = make_scheduler(pipe, scheduler_name)
+            latents_gpu = self.denoise(
+                pipe,
+                noise_latents,
+                text_embeddings,
+                num_inference_steps,
+                guidance_scale,
+                generator,
+            )
+
+        image = pipe.decode_latents(latents_gpu)
+        pipe.run_safety_checker(image, self.device, text_embeddings.dtype)
+        latents_cpu = latents_gpu.detach().to("cpu", torch.float32)
+        return latents_gpu, latents_cpu, image
+
+    def _prepare_flux_anchor(
+        self,
+        pipe: FluxPipeline,
+        image_path: Optional[Path],
+        width: int,
+        height: int,
+        noise_latents: torch.Tensor,
+        embeddings: FluxEmbeddings,
+        num_inference_steps: int,
+        guidance_scale: float,
+        generator: torch.Generator,
+    ) -> Tuple[torch.Tensor, torch.Tensor, np.ndarray]:
+        if image_path is not None:
+            latents_gpu = self._encode_flux_image(
+                pipe, image_path, width, height
+            )
+        else:
+            latents_gpu = self._flux_denoise(
+                pipe,
+                noise_latents,
+                embeddings,
+                num_inference_steps,
+                guidance_scale,
+                generator,
+                height,
+                width,
+            )
+
+        image = self._decode_flux_latents(pipe, latents_gpu, height, width)
+        latents_cpu = latents_gpu.detach().to("cpu", torch.float32)
+        return latents_gpu, latents_cpu, image
+
+    def _flux_denoise(
+        self,
+        pipe: FluxPipeline,
+        latents: torch.Tensor,
+        embeddings: FluxEmbeddings,
+        num_inference_steps: int,
+        guidance_scale: float,
+        generator: torch.Generator,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+            pipe.scheduler.config
+        )
+        prompt_embeds = embeddings.prompt_embeds.to(
+            self.device, dtype=pipe.transformer.dtype
+        )
+        pooled_prompt_embeds = embeddings.pooled_prompt_embeds.to(
+            self.device, dtype=pipe.transformer.dtype
+        )
+        result = pipe(
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps,
+            generator=generator,
+            latents=latents,
+            height=height,
+            width=width,
+            output_type="latent",
+        )
+        return result.images
+
+    def _decode_flux_latents(
+        self,
+        pipe: FluxPipeline,
+        latents: torch.Tensor,
+        height: int,
+        width: int,
+    ) -> np.ndarray:
+        latents = latents.to(self.device, dtype=pipe.transformer.dtype)
+        latents = pipe._unpack_latents(latents, height, width, pipe.vae_scale_factor)
+        latents = (latents / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
+        with torch.inference_mode():
+            image = pipe.vae.decode(latents, return_dict=False)[0]
+        images = pipe.image_processor.postprocess(image, output_type="np")
+        if isinstance(images, list):
+            images = images[0]
+        return images.astype(np.float32)
+
+    def interpolate_latents(
+        self,
+        frames_latents: List[torch.Tensor],
+        num_interpolation_steps: int,
+        decode_fn,
+    ) -> List[np.ndarray]:
+        print("Interpolating images from latents")
+        images: List[np.ndarray] = []
+        with torch.inference_mode():
+            if num_interpolation_steps <= 0:
+                for latents in frames_latents:
+                    images.append(decode_fn(latents))
+                return images
+
             for i in range(len(frames_latents) - 1):
                 latents_start = frames_latents[i]
                 latents_end = frames_latents[i + 1]
                 for j in range(num_interpolation_steps):
                     x = j / num_interpolation_steps
                     latents = latents_start * (1 - x) + latents_end * x
-                    image = self.pipe.decode_latents(latents.to(torch.float16))[
-                        0
-                    ].astype("float32")
-                    images.append(image)
+                    images.append(decode_fn(latents))
         return images
 
-    def save_mp4(self, images, fps, width, height):
+    def save_mp4(
+        self, images: List[np.ndarray], fps: int, width: int, height: int
+    ) -> Path:
         print("Saving MP4")
         output_path = "/tmp/output.mp4"
 
@@ -274,19 +821,16 @@ class Predictor(BasePredictor):
                 "tune": "film",
             },
         )
-        # stream.bit_rate = 8000000
-        # stream.bit_rate = 16000000
         stream.width = width
         stream.height = height
 
-        for i, image in enumerate(images):
+        for image in images:
             image = (image * 255).astype(np.uint8)
             image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
             frame = av.VideoFrame.from_ndarray(image, format="bgr24")
             packet = stream.encode(frame)
             output.mux(packet)
 
-        # flush
         packet = stream.encode(None)
         output.mux(packet)
         output.close()
@@ -295,75 +839,67 @@ class Predictor(BasePredictor):
 
     def denoise(
         self,
-        latents,
-        text_embeddings,
-        t_start,
-        t_end,
-        num_inference_steps,
-        guidance_scale,
-        generator,
-    ):
+        pipe: StableDiffusionPipeline,
+        latents: torch.Tensor,
+        text_embeddings: torch.Tensor,
+        num_inference_steps: int,
+        guidance_scale: float,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        pipe.scheduler.set_timesteps(num_inference_steps, device=self.device)
         eta = 0
-        timesteps = self.pipe.scheduler.timesteps
-        do_classifier_free_guidance = guidance_scale > 1.0
+        timesteps = pipe.scheduler.timesteps
+        do_cfg = guidance_scale > 1.0
 
-        # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
-        extra_step_kwargs = self.pipe.prepare_extra_step_kwargs(generator, eta)
+        extra_step_kwargs = pipe.prepare_extra_step_kwargs(generator, eta)
 
-        with self.pipe.progress_bar(
-            total=num_inference_steps
-        ) as progress_bar, torch.inference_mode(), torch.no_grad():
-            for i, t in enumerate(timesteps):
-                # expand the latents if we are doing classifier free guidance
+        with pipe.progress_bar(total=num_inference_steps) as progress_bar:
+            for t in timesteps:
                 latent_model_input = (
-                    torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                    torch.cat([latents] * 2) if do_cfg else latents
                 )
-                latent_model_input = self.pipe.scheduler.scale_model_input(
+                latent_model_input = pipe.scheduler.scale_model_input(
                     latent_model_input, t
                 )
 
-                # predict the noise residual
-                noise_pred = self.pipe.unet(
+                noise_pred = pipe.unet(
                     latent_model_input, t, encoder_hidden_states=text_embeddings
                 ).sample
 
-                # perform guidance
-                if do_classifier_free_guidance:
+                if do_cfg:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (
                         noise_pred_text - noise_pred_uncond
                     )
 
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.pipe.scheduler.step(
+                latents = pipe.scheduler.step(
                     noise_pred, t, latents, **extra_step_kwargs
                 ).prev_sample
+
+                progress_bar.update()
 
         return latents
 
 
-def make_scheduler(num_inference_steps, from_scheduler=None):
-    scheduler = PNDMScheduler(
-        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear"
-    )
-    scheduler.set_timesteps(num_inference_steps, device="cuda")
-    if from_scheduler:
-        scheduler.cur_model_output = from_scheduler.cur_model_output
-        scheduler.counter = from_scheduler.counter
-        scheduler.cur_sample = from_scheduler.cur_sample
-        scheduler.ets = from_scheduler.ets[:]
-    return scheduler
+def make_scheduler(pipe: StableDiffusionPipeline, scheduler_name: str):
+    name = scheduler_name.lower()
+    scheduler_map = {
+        "pndm": PNDMScheduler,
+        "lms": LMSDiscreteScheduler,
+        "euler": EulerDiscreteScheduler,
+    }
+    scheduler_cls = scheduler_map.get(name, EulerDiscreteScheduler)
+    return scheduler_cls.from_config(pipe.scheduler.config)
 
 
 def slerp(t, v0, v1, DOT_THRESHOLD=0.9995):
-    """helper function to spherically interpolate two arrays v1 v2"""
-    # from https://gist.github.com/nateraw/c989468b74c616ebbc6474aa8cdd9e53
-
     if not isinstance(v0, np.ndarray):
         inputs_are_torch = True
         input_device = v0.device
         v0 = v0.cpu().numpy()
         v1 = v1.cpu().numpy()
+    else:
+        inputs_are_torch = False
 
     dot = np.sum(v0 * v1 / (np.linalg.norm(v0) * np.linalg.norm(v1)))
     if np.abs(dot) > DOT_THRESHOLD:
